@@ -1,57 +1,95 @@
 // db-helper.js — Mini-wrapper promisificado de IndexedDB (Vanilla JS, solo Promesas)
-// Se usa tanto en la página (window) como en el Service Worker (self).
-var DB_NAME = 'outbox-db';
-var DB_VERSION = 1;
-var STORE = 'outbox';
+// Se carga en la página (index.html) y en el Service Worker (importScripts).
+const DB_NAME = 'pwa-outbox-db';
+const DB_VERSION = 1;
+const STORE_NAME = 'transacciones_pendientes';
 
-function abrirDB() {
-  return new Promise(function (resolve, reject) {
-    var req = indexedDB.open(DB_NAME, DB_VERSION);
-    // Solo se ejecuta al crear la BD o subir de versión: aquí se define el esquema
-    req.onupgradeneeded = function (e) {
-      var db = e.target.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        var store = db.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
-        store.createIndex('estado', 'estado', { unique: false });
+// Pieza 1: Apertura de la base de datos
+function abrirDB(){
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    // Se ejecuta solo si la BD es nueva o sube de versión
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        // keyPath 'id' con autoIncrement genera IDs numéricos automáticos
+        db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
       }
     };
-    req.onsuccess = function (e) { resolve(e.target.result); };
-    req.onerror = function (e) { reject(e.target.error); };
+
+    request.onsuccess = (event) => resolve(event.target.result);
+    request.onerror = (event) => reject(event.target.error);
   });
 }
 
-// Ejecuta una operación dentro de una transacción y resuelve al completarse
-function conStore(modo, operacion) {
-  return abrirDB().then(function (db) {
-    return new Promise(function (resolve, reject) {
-      var tx = db.transaction(STORE, modo); // 'readonly' | 'readwrite'
-      var store = tx.objectStore(STORE);
-      var resultado;
-      var req = operacion(store);
-      if (req) { req.onsuccess = function () { resultado = req.result; }; }
-      tx.oncomplete = function () { db.close(); resolve(resultado); };
-      tx.onerror = function () { db.close(); reject(tx.error); };
-      tx.onabort = function () { db.close(); reject(tx.error); };
+// Pieza 2: CREATE — se resuelve en tx.oncomplete (dato garantizado en disco)
+function guardarRegistro(datos){
+  return abrirDB().then((db) => {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_NAME], 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      let idGenerado;
+      const req = store.add(datos);
+      req.onsuccess = (event) => { idGenerado = event.target.result; };
+      tx.oncomplete = () => resolve(idGenerado);
+      tx.onerror = (event) => reject(event.target.error);
     });
   });
 }
 
-var dbHelper = {
-  agregar: function (registro) {
-    return conStore('readwrite', function (s) { return s.add(registro); });
-  },
-  obtenerTodos: function () {
-    return conStore('readonly', function (s) { return s.getAll(); });
-  },
-  obtenerPendientes: function () {
-    return conStore('readonly', function (s) {
-      return s.index('estado').getAll('pendiente');
+// Pieza 3: READ — transacción de solo lectura
+function obtenerTodosLosRegistros(){
+  return abrirDB().then((db) => {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_NAME], 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.getAll();
+      req.onsuccess = (event) => resolve(event.target.result);
+      req.onerror = (event) => reject(event.target.error);
     });
-  },
-  eliminar: function (id) {
-    return conStore('readwrite', function (s) { return s.delete(id); });
-  },
-  limpiar: function () {
-    return conStore('readwrite', function (s) { return s.clear(); });
-  }
-};
+  });
+}
+
+// Pieza 4: DELETE
+function eliminarRegistro(id){
+  return abrirDB().then((db) => {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_NAME], 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      store.delete(id);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = (event) => reject(event.target.error);
+    });
+  });
+}
+
+// UPDATE — get + put dentro de la MISMA transacción 'readwrite'
+function actualizarEstadoRegistro(id, nuevoEstado){
+  return abrirDB().then((db) => {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_NAME], 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+
+      // 1. Obtener el registro actual por su llave primaria
+      const reqGet = store.get(id);
+
+      reqGet.onsuccess = (event) => {
+        const registro = event.target.result;
+        if (!registro) {
+          reject(new Error(`No se encontró el registro con ID: ${id}`));
+          return;
+        }
+
+        // 2. Modificar la propiedad y sobrescribir con .put()
+        registro.estado = nuevoEstado;
+        registro.fechaSincronizacion = Date.now();
+        store.put(registro);
+      };
+
+      // 3. Resolver cuando la transacción completa el guardado en disco
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = (event) => reject(event.target.error);
+    });
+  });
+}
