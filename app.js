@@ -1,121 +1,184 @@
-// app.js — Interfaz + Patrón Outbox
-var API_URL = 'https://jsonplaceholder.typicode.com/posts';
-var SYNC_TAG = 'sync-outbox';
-var soportaSync = 'serviceWorker' in navigator && 'SyncManager' in window;
+// app.js — Interfaz, envío resiliente (Patrón Outbox) y reconexión
+const ENDPOINT = 'https://jsonplaceholder.typicode.com/posts';
 
-var $ = function (id) { return document.getElementById(id); };
-
-function log(msg) {
-  $('log').textContent = new Date().toLocaleTimeString() + ' — ' + msg + '\n' + $('log').textContent;
-}
-
-function pintarEstadoRed() {
-  var el = $('estadoRed');
-  el.textContent = navigator.onLine ? 'En línea' : 'Sin conexión';
-  el.className = 'estado ' + (navigator.onLine ? 'online' : 'offline');
-}
-
-function renderizarBandeja() {
-  return dbHelper.obtenerTodos().then(function (items) {
-    $('contador').textContent = items.length;
-    $('lista').innerHTML = '';
-    items.forEach(function (it) {
-      var li = document.createElement('li');
-      li.innerHTML = '<span><strong></strong><br><small></small></span>';
-      li.querySelector('strong').textContent = it.payload.title;
-      li.querySelector('small').textContent = it.estado + ' · ' + new Date(it.fecha).toLocaleString();
-      var b = document.createElement('button');
-      b.textContent = '✕'; b.className = 'peligro';
-      b.onclick = function () { dbHelper.eliminar(it.id).then(renderizarBandeja); };
-      li.appendChild(b);
-      $('lista').appendChild(li);
-    });
-  });
-}
-
-// Si falla la red, el envío se encola como 'pendiente'
-function encolar(payload) {
-  return dbHelper.agregar({ payload: payload, estado: 'pendiente', fecha: Date.now() })
-    .then(function () {
-      log('Sin red: guardado en la bandeja de salida.');
-      return registrarSync();
-    })
-    .then(renderizarBandeja);
-}
-
-function enviarPost(payload) {
-  return fetch(API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  }).then(function (r) {
-    if (!r.ok) { throw new Error('HTTP ' + r.status); }
-    return r.json();
-  });
-}
-
-// Registra la etiqueta de Background Sync (o no hace nada si no hay soporte)
-function registrarSync() {
-  if (!soportaSync) { return Promise.resolve(); }
-  return navigator.serviceWorker.ready.then(function (reg) {
-    return reg.sync.register(SYNC_TAG);
-  }).then(function () {
-    log('Background Sync registrado (' + SYNC_TAG + ').');
-  }).catch(function (e) { log('No se pudo registrar sync: ' + e.message); });
-}
-
-// Respaldo para navegadores sin SyncManager (Safari/iOS): sincroniza desde la página
-function sincronizarDesdePagina() {
-  return dbHelper.obtenerPendientes().then(function (pendientes) {
-    if (!pendientes.length) { return; }
-    return Promise.all(pendientes.map(function (it) {
-      return enviarPost(it.payload).then(function () { return dbHelper.eliminar(it.id); });
-    })).then(function () {
-      log('Respaldo "online": ' + pendientes.length + ' envío(s) sincronizado(s).');
-    });
-  }).catch(function (e) { log('Sincronización fallida: ' + e.message); })
-    .then(renderizarBandeja);
-}
-
-$('formulario').addEventListener('submit', function (e) {
-  e.preventDefault();
-  var payload = { title: $('titulo').value, body: $('cuerpo').value, userId: 1 };
-  e.target.reset();
-  if (!navigator.onLine) { encolar(payload); return; }
-  enviarPost(payload)
-    .then(function (data) { log('Enviado al servidor (id ' + data.id + ').'); })
-    .catch(function () { return encolar(payload); });
-});
-
-$('btnPurgar').addEventListener('click', function () {
-  dbHelper.limpiar().then(function () { log('Bandeja purgada.'); return renderizarBandeja(); });
-});
-
-$('btnSync').addEventListener('click', function () {
-  if (soportaSync) { registrarSync(); } else { sincronizarDesdePagina(); }
-});
-
-window.addEventListener('online', function () {
-  pintarEstadoRed();
-  // Degradación elegante: solo la página sincroniza si no existe SyncManager
-  if (!soportaSync) { sincronizarDesdePagina(); }
-});
-window.addEventListener('offline', pintarEstadoRed);
-
+// Fragmento G: recepción de mensajes del Service Worker + registro del SW
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('./sw.js')
-    .then(function () { log('Service Worker registrado.'); })
-    .catch(function (e) { log('Error al registrar SW: ' + e.message); });
-
-  // Mensajes del SW tras sincronizar en segundo plano
-  navigator.serviceWorker.addEventListener('message', function (e) {
-    if (e.data && e.data.tipo === 'SYNC_COMPLETADO') {
-      log('Service Worker sincronizó ' + e.data.enviados + ' envío(s).');
-      renderizarBandeja();
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event.data && event.data.tipo === 'OUTBOX_SINCRONIZADO') {
+      console.log('[UI] Confirmación recibida del Service Worker. Actualizando bandeja...');
+      renderizarColaOutbox();
     }
   });
+
+  navigator.serviceWorker.register('./sw.js')
+    .then((reg) => console.log('[SW] Registrado con scope:', reg.scope))
+    .catch((error) => console.error('[SW] Error al registrar:', error));
 }
 
-$('soporteSync').textContent = soportaSync ? 'Background Sync ✔' : 'Respaldo con evento online';
-pintarEstadoRed();
-renderizarBandeja();
+// Indicador visual de conectividad
+function actualizarIndicadorRed(){
+  const badge = document.getElementById('badge-red');
+  if (navigator.onLine) {
+    badge.textContent = 'En Línea';
+    badge.className = 'badge online';
+  } else {
+    badge.textContent = 'Sin Conexión';
+    badge.className = 'badge offline';
+  }
+}
+
+// READ: lee IndexedDB y dibuja la cola en pantalla
+function renderizarColaOutbox(){
+  return obtenerTodosLosRegistros().then((registros) => {
+    const lista = document.getElementById('lista-outbox');
+    lista.innerHTML = '';
+
+    if (registros.length === 0) {
+      const vacio = document.createElement('li');
+      vacio.className = 'vacio';
+      vacio.textContent = 'La bandeja está vacía.';
+      lista.appendChild(vacio);
+      return;
+    }
+
+    registros.forEach((item) => {
+      const li = document.createElement('li');
+
+      const info = document.createElement('div');
+      const titulo = document.createElement('strong');
+      titulo.textContent = item.titulo;
+      const hora = document.createElement('span');
+      hora.className = 'hora';
+      hora.textContent = new Date(item.fechaCreacion).toLocaleTimeString('es-MX');
+      info.appendChild(titulo);
+      info.appendChild(hora);
+
+      const estado = document.createElement('span');
+      estado.className = 'estado ' + item.estado;
+      estado.textContent = item.estado;
+
+      li.appendChild(info);
+      li.appendChild(estado);
+      lista.appendChild(li);
+    });
+  });
+}
+
+// CREATE: intenta el POST; si falla la red, encola en IndexedDB como 'pendiente'
+function procesarEnvioReporte(datosFormulario){
+  return fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: datosFormulario.titulo, body: datosFormulario.descripcion })
+  })
+    .then((respuesta) => {
+      if (!respuesta.ok) throw new Error('Error HTTP del servidor');
+      return respuesta.json();
+    })
+    .then(() => {
+      // Envío exitoso en vivo: registrar en bitácora local como sincronizado
+      return guardarRegistro({
+        ...datosFormulario,
+        estado: 'sincronizado',
+        fechaCreacion: Date.now()
+      });
+    })
+    .catch(() => {
+      console.warn('[Outbox] Sin conexión. Encolando en IndexedDB...');
+
+      return guardarRegistro({
+        ...datosFormulario,
+        estado: 'pendiente',
+        fechaCreacion: Date.now()
+      })
+        .then(() => {
+          // Detección de soporte para Background Sync API
+          if ('serviceWorker' in navigator && 'SyncManager' in window) {
+            return navigator.serviceWorker.ready
+              .then((registro) => {
+                console.log('[Outbox] Registrando etiqueta sync-reportes en el SW...');
+                return registro.sync.register('sync-reportes');
+              });
+          }
+        });
+    })
+    .then(() => {
+      // Actualizar la lista visual en ambos escenarios
+      return renderizarColaOutbox();
+    });
+}
+
+// UPDATE (fallback para navegadores sin SyncManager, ej. Safari/iOS)
+function sincronizarPendientesFallback(){
+  console.log('[Outbox] Conexión detectada. Buscando registros pendientes...');
+
+  return obtenerTodosLosRegistros()
+    .then((registros) => {
+      const pendientes = registros.filter((item) => item.estado === 'pendiente');
+
+      if (pendientes.length === 0) {
+        console.log('[Outbox] No hay transacciones pendientes por sincronizar.');
+        return;
+      }
+
+      // Convertir cada registro pendiente en una promesa de envío + actualización
+      const promesasDeEnvio = pendientes.map((item) => {
+        return fetch(ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: item.titulo, body: item.descripcion })
+        })
+          .then((res) => {
+            if (!res.ok) throw new Error('Falla al reintentar envío');
+            return actualizarEstadoRegistro(item.id, 'sincronizado');
+          });
+      });
+
+      // Esperar a que todos los reenvíos concluyan
+      return Promise.all(promesasDeEnvio);
+    })
+    .then(() => {
+      return renderizarColaOutbox();
+    })
+    .catch((error) => {
+      console.error('[Outbox] Error durante la sincronización masiva:', error);
+    });
+}
+
+// Conexión del formulario (submit)
+document.getElementById('form-incidencia').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const datos = {
+    titulo: document.getElementById('titulo').value.trim(),
+    descripcion: document.getElementById('descripcion').value.trim()
+  };
+  procesarEnvioReporte(datos).then(() => e.target.reset());
+});
+
+// DELETE: purga los registros ya sincronizados
+document.getElementById('btn-purgar').addEventListener('click', () => {
+  obtenerTodosLosRegistros()
+    .then((registros) => {
+      const sincronizados = registros.filter((item) => item.estado === 'sincronizado');
+      return Promise.all(sincronizados.map((item) => eliminarRegistro(item.id)));
+    })
+    .then(() => renderizarColaOutbox())
+    .catch((error) => console.error('[Outbox] Error al purgar:', error));
+});
+
+// Fragmento F: prevención de condiciones de carrera en el evento online
+window.addEventListener('online', () => {
+  actualizarIndicadorRed();
+
+  // Degradación elegante: solo sincronizar desde UI si NO hay Background Sync (ej. Safari/iOS)
+  if (!('SyncManager' in window)) {
+    console.log('[Outbox] Navegador sin SyncManager. Ejecutando fallback por evento online...');
+    sincronizarPendientesFallback();
+  }
+});
+
+window.addEventListener('offline', actualizarIndicadorRed);
+
+// Al cargar la página: READ inicial (rescata los registros guardados aunque se haya cerrado la pestaña)
+actualizarIndicadorRed();
+renderizarColaOutbox();
