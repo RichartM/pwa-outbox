@@ -1,55 +1,104 @@
-// sw.js — Cache del app shell + motor de sincronización (Background Sync)
+// sw.js — App Shell con rutas relativas + Background Sync
+// Importar el mini-wrapper de IndexedDB en el contexto del Service Worker
 importScripts('./db-helper.js');
 
-var CACHE = 'outbox-shell-v1';
-var API_URL = 'https://jsonplaceholder.typicode.com/posts';
-var SYNC_TAG = 'sync-outbox';
-var SHELL = ['./', './index.html', './app.js', './db-helper.js', './manifest.json'];
+const CACHE_STATIC_NAME = 'static-outbox-v2';
+const ENDPOINT = 'https://jsonplaceholder.typicode.com/posts';
+const STATIC_FILES = [
+  './',
+  './index.html',
+  './styles.css',
+  './db-helper.js',
+  './app.js',
+  './manifest.json',
+  './icon.svg'
+];
 
-self.addEventListener('install', function (e) {
-  e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }));
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_STATIC_NAME).then((cache) => cache.addAll(STATIC_FILES))
+  );
   self.skipWaiting();
 });
 
-self.addEventListener('activate', function (e) {
-  e.waitUntil(
-    caches.keys().then(function (keys) {
-      return Promise.all(keys.filter(function (k) { return k !== CACHE; })
-        .map(function (k) { return caches.delete(k); }));
-    }).then(function () { return self.clients.claim(); })
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(
+        keys.filter((key) => key !== CACHE_STATIC_NAME).map((key) => caches.delete(key))
+      ))
+      .then(() => self.clients.claim())
   );
 });
 
-// Cache first para el shell; las peticiones POST pasan directo a la red
-self.addEventListener('fetch', function (e) {
-  if (e.request.method !== 'GET') { return; }
-  e.respondWith(caches.match(e.request).then(function (r) { return r || fetch(e.request); }));
+// Cache First para el App Shell; los POST no se interceptan
+self.addEventListener('fetch', (event) => {
+  if (event.request.method !== 'GET') return;
+  event.respondWith(
+    caches.match(event.request).then((respuesta) => respuesta || fetch(event.request))
+  );
 });
 
-function avisarClientes(mensaje) {
-  return self.clients.matchAll({ includeUncontrolled: true, type: 'window' }).then(function (clientes) {
-    clientes.forEach(function (c) { c.postMessage(mensaje); });
-  });
-}
-
-function sincronizarOutbox() {
-  return dbHelper.obtenerPendientes().then(function (pendientes) {
-    return Promise.all(pendientes.map(function (it) {
-      return fetch(API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(it.payload)
-      }).then(function (r) {
-        if (!r.ok) { throw new Error('HTTP ' + r.status); }
-        return dbHelper.eliminar(it.id);
+// Fragmento B: notificar a las pestañas abiertas (postMessage)
+function notificarClientesActualizacion() {
+  return self.clients.matchAll({ type: 'window', includeUncontrolled: true })
+    .then((clientes) => {
+      clientes.forEach((cliente) => {
+        cliente.postMessage({
+          tipo: 'OUTBOX_SINCRONIZADO',
+          timestamp: Date.now()
+        });
       });
-    })).then(function () {
-      return avisarClientes({ tipo: 'SYNC_COMPLETADO', enviados: pendientes.length });
     });
-  });
-  // Si algo falla, la promesa se rechaza y el navegador reintenta el sync más tarde
 }
 
-self.addEventListener('sync', function (e) {
-  if (e.tag === SYNC_TAG) { e.waitUntil(sincronizarOutbox()); }
+// Fragmento C: motor de sincronización en segundo plano
+function sincronizarPendientesSW() {
+  console.log('[SW-Sync] Ejecutando barrido de transacciones pendientes...');
+
+  return obtenerTodosLosRegistros()
+    .then((registros) => {
+      const pendientes = registros.filter((item) => item.estado === 'pendiente');
+
+      if (pendientes.length === 0) {
+        console.log('[SW-Sync] Cola limpia. Nada por sincronizar.');
+        return;
+      }
+
+      const promesasDeEnvio = pendientes.map((item) => {
+        return fetch(ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: item.titulo,
+            body: item.descripcion
+          })
+        })
+          .then((respuesta) => {
+            if (!respuesta.ok) {
+              throw new Error(`Error HTTP ${respuesta.status} al sincronizar ID ${item.id}`);
+            }
+            return actualizarEstadoRegistro(item.id, 'sincronizado');
+          });
+      });
+
+      return Promise.all(promesasDeEnvio)
+        .then(() => notificarClientesActualizacion());
+    });
+}
+
+// Fragmento D: evento sync
+self.addEventListener('sync', (event) => {
+  console.log('[SW-Sync] Evento sync disparado con etiqueta:', event.tag);
+
+  if (event.tag === 'sync-reportes') {
+    event.waitUntil(
+      sincronizarPendientesSW()
+        .catch((error) => {
+          console.error('[SW-Sync] Falla en sincronización; el navegador reintentará luego:', error);
+          // Relanzar el error indica al navegador que debe programar un reintento automático
+          throw error;
+        })
+    );
+  }
 });
